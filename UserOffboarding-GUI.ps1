@@ -21,15 +21,23 @@
 .NOTES
     File Name           : UserOffboarding-GUI.ps1
     Author              : Chien Nguyen (chien@gocourant.com)
-    Current Version     : WIP-0.6RC
+    Current Version     : WIP-0.7 (testing needed)
     Copyright           : GNU General Public License v3.0
 
 .LINK
     Script posted over:
     https://github.com/Chienguin/UserOffboarding
 #>
+
+# Global Variables
 $DISABLED_OU = 'PATH_TO_DISABLED_USERS_OU'
 $SHARED_MAILBOX_OU = 'PATH_TO_SHARED_MAILBOX_OU'
+
+$OU_CHECKED = $false
+$AD_CHECKED = $false
+$M365_CHECKED = $false
+$RESULTS = ''
+
 
 #region FormGUI
 Add-Type -AssemblyName System.Windows.Forms
@@ -189,20 +197,77 @@ $frm_UserOffboarding.controls.AddRange(@($lbl_Output,$pnl_ActiveDirectory,$pnl_M
 #endregion FormGUI
 
 #region functions
+function isConnected {
+    try {
+        $var = Get-AzureADTenantDetail
+    } 
+    catch [Microsoft.Open.Azure.AD.CommonLibrary.AadNeedAuthenticationException] {
+        $RESULTS = "Logging into Azure AD"
+        $lbl_Output.text = $RESULTS
+        Connect-AzureAD
+    }
+
+    if (!(Get-PSSession | Where-Object {$_.Name -match 'ExchangeOnline' -and $_.Availability -eq 'Available'})) {
+        $RESULTS = $RESULTS + '`n' + "Connecting to Exchange Online"
+        $lbl_Output.text = $RESULTS
+        Connect-ExchangeOnline
+    }
+
+    return
+}
+
+function CheckInput {
+    if ($AD_CHECKED -eq $false) {
+        $inputUN = $txt_Username.text
+
+        if ($inputUN = Get-ADUser -Filter "SamAccountName -eq '$inputUN'") {
+            $AD_CHECKED = $true
+        } else {
+            $RESULTS = "$inputUN is not a valid user!"
+            $lbl_Output.text = $RESULTS
+            return
+        }
+    }
+
+    if ($OU_CHECKED -eq $false) {
+        if (($DISABLED_OU -eq 'PATH_TO_DISABLED_USERS_OU') -OR ($DISABLED_OU -eq "")){
+            $DN = (Get-ADUser -Identity $User -Properties DistinguishedName).DistinguishedName
+            $DISABLED_OU = $DN.Substring($DN.IndexOf('OU='))
+        }
+    
+        if (($SHARED_MAILBOX_OU -eq 'PATH_TO_SHARED_MAILBOX_OU') -OR ($SHARED_MAILBOX_OU -eq "")){
+            $SHARED_MAILBOX_OU = $DISABLED_OU
+        }
+
+        $OU_CHECKED = $true
+    }
+
+    if ($M365_CHECKED -eq $false) {
+        {isConnected}
+
+        $inputEmail = $txt_Email.text
+
+        if ($inputEmail = Get-EXOMailbox -Filter "EmailAddresses -eq '$inputEmail'") {
+            $M365_CHECKED = $true
+        } else {
+            $RESULTS = "$inputEmail is not a valid email address!"
+            $lbl_Output.text = $RESULTS
+            return
+        }
+    }
+
+    return
+}
+
 function OffboardUser {
-    $RESULTS = ''
     $USER = txt_Username.text
     $UPN = txt_Email.text
     $DESCRIPTION = $txt_Description.text
 
-    # Checks for assigned OU paths
-    if (($DISABLED_OU -eq 'PATH_TO_DISABLED_USERS_OU') -OR ($DISABLED_OU -eq "")){
-        $DN = (Get-ADUser -Identity $User -Properties DistinguishedName).DistinguishedName
-        $DISABLED_OU = $DN.Substring($DN.IndexOf('OU='))
-    }
+    {CheckInput}
 
-    if (($SHARED_MAILBOX_OU -eq 'PATH_TO_SHARED_MAILBOX_OU') -OR ($SHARED_MAILBOX_OU -eq "")){
-        $SHARED_MAILBOX_OU = $DISABLED_OU
+    if (($AD_CHECKED -eq $false) -OR ($OU_CHECKED -eq $false) -OR ($M365_CHECKED -eq $false)) {
+        return
     }
 
     # Disables User Account if box is checked
@@ -231,23 +296,15 @@ function OffboardUser {
     Set-ADUser $USER -Replace @{Description = $newDesc}
     
 
-    # Connect to Azure AD
-    $RESULTS = $RESULTS + '`n' + "Logging into Azure AD"
-    $lbl_Output.text = $RESULTS
-    Connect-AzureAD
-
-    # Connect to M365
-    $RESULTS = $RESULTS + '`n' + "Connecting to Exchange Online"
-    $lbl_Output.text = $RESULTS
-    Connect-ExchangeOnline
-    $OffboardDN = (Get-Mailbox -Identity $UPN -IncludeInactiveMailbox).DistinguishedName
+    # Begin M365 block
+    $OffboardDN = (Get-EXOMailbox -Identity $UPN -IncludeInactiveMailbox).DistinguishedName
 
     # Remove user from all distribution groups
     if ($chk_DistroGroups.Checked -eq $true) {
-        $RESULTS = $RESULTS + '`n' + "Removing $USER from distribution groups"
+        $RESULTS = $RESULTS + '`n' + "Removing $UPN from distribution groups"
         $lbl_Output.text = $RESULTS
-        Get-Recipient -Filter "Members -eq '$OffboardDN'" | foreach-object { 
-            $RESULTS = $RESULTS + '`n' + "Removing $USER from $($_.name)"
+        Get-EXORecipient -Filter "Members -eq '$OffboardDN'" | foreach-object { 
+            $RESULTS = $RESULTS + '`n' + "Removing $UPN from $($_.name)"
             $lbl_Output.text = $RESULTS
             Remove-DistributionGroupMember -Identity $_.ExternalDirectoryObjectId -Member $OffboardDN -BypassSecurityGroupManagerCheck -Confirm:$false 
         }
@@ -256,10 +313,10 @@ function OffboardUser {
 
     # Remove user from all Teams and Unified Groups
     if ($chk_Teams.Checked -eq $true){
-        $RESULTS = $RESULTS + '`n' + "Removing $USER from all Teams and Unified Groups"
+        $RESULTS = $RESULTS + '`n' + "Removing $UPN from all Teams and Unified Groups"
         $lbl_Output.text = $RESULTS
-        Get-Recipient -Filter "Members -eq '$OffboardDN'" -RecipientTypeDetails 'GroupMailbox' | foreach-object {
-            $RESULTS = $RESULTS + '`n' + "Removing $USER from $($_.name)"
+        Get-EXORecipient -Filter "Members -eq '$OffboardDN'" -RecipientTypeDetails 'GroupMailbox' | foreach-object {
+            $RESULTS = $RESULTS + '`n' + "Removing $UPN from $($_.name)"
             $lbl_Output.text = $RESULTS
             Remove-UnifiedGroupLinks -Identity $_.ExternalDirectoryObjectId -Links $UPN -LinkType Member -Confirm:$false
         }
@@ -267,14 +324,14 @@ function OffboardUser {
 
     # Convert user mailbox to a shared mailbox
     if ($chk_SharedMailbox.Checked -eq $true) {
-        $RESULTS = $RESULTS + '`n' + "Converting $USER to a Shared Mailbox"
+        $RESULTS = $RESULTS + '`n' + "Converting $UPN to a Shared Mailbox"
         $lbl_Output.text = $RESULTS
         Set-Mailbox $UPN -Type Shared
     }
 
     # Hide user from global address list
     if ($chk_AddressBook.Checked -eq $true) {
-        $RESULTS = $RESULTS + '`n' + "Hiding $USER from Global Address List"
+        $RESULTS = $RESULTS + '`n' + "Hiding $UPN from Global Address List"
         $lbl_Output.text = $RESULTS
         Set-Mailbox $UPN -HiddenFromAddressListsEnabled $true
     }
@@ -296,6 +353,8 @@ function OffboardUser {
         $RESULTS = $RESULTS + '`n' + "Removed licenses:" + '`n' + $AssignedLicensesTable
         $lbl_Output.text = $RESULTS
     }
+
+    return
 }
 #endregion functions
 
