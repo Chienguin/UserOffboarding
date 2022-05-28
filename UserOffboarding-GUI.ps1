@@ -199,7 +199,7 @@ $frm_UserOffboarding.controls.AddRange(@($lbl_Output,$pnl_ActiveDirectory,$pnl_M
 #region functions
 function isConnected {
     try {
-        $var = Get-AzureADTenantDetail
+        Get-AzureADTenantDetail
     } 
     catch [Microsoft.Open.Azure.AD.CommonLibrary.AadNeedAuthenticationException] {
         $RESULTS = "Logging into Azure AD"
